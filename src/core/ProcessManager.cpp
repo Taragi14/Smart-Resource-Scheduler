@@ -1,473 +1,575 @@
 #include "ProcessManager.h"
-#include <fstream>
-#include <sstream>
-#include <algorithm>
-#include <dirent.h>
-#include <sys/stat.h>
+#include <signal.h>
 #include <sys/resource.h>
-#include <errno.h>
-#include <cstring>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <algorithm>
+#include <fstream>
 #include <iostream>
-#include <iomanip>
+#include <sstream>
 
-using namespace std;
-
-namespace SmartScheduler {
-
-ProcessManager::ProcessManager() 
-    : monitoring_active_(false)
-    , shutdown_requested_(false)
-    , last_system_cpu_time_(0.0)
-    , last_update_time_(chrono::steady_clock::now())
-    , update_interval_(chrono::milliseconds(1000))
-{
-    // Add default critical processes
-    critical_process_names_.insert("systemd");
-    critical_process_names_.insert("kthreadd");
-    critical_process_names_.insert("init");
-    critical_process_names_.insert("kernel");
-    critical_process_names_.insert("NetworkManager");
-    critical_process_names_.insert("dbus");
+ProcessManager::ProcessManager(std::shared_ptr<SystemMonitor> monitor)
+    : system_monitor_(monitor)
+    , auto_management_enabled_(false)
+    , memory_protection_enabled_(true)
+    , cpu_throttling_enabled_(true)
+    , system_cpu_threshold_(90.0)
+    , system_memory_threshold_(85.0)
+    , memory_warning_threshold_kb_(1024 * 1024) // 1GB
+    , cpu_warning_threshold_percent_(80.0)
+    , monitoring_active_(false)
+    , total_terminated_processes_(0)
+    , total_suspended_processes_(0) {
+    
+    // Initialize critical system processes
+    critical_process_names_ = {
+        "init", "kernel", "kthreadd", "systemd", "dbus", "networkd",
+        "X", "Xorg", "gdm", "lightdm", "pulseaudio", "NetworkManager"
+    };
+    
+    // Initialize system processes
+    system_process_names_ = {
+        "ksoftirqd", "migration", "rcu_", "watchdog", "systemd-",
+        "kworker", "irq/", "mmcqd", "jbd2", "ext4-", "usb-storage"
+    };
+    
+    // Start monitoring thread
+    monitoring_active_.store(true);
+    monitor_thread_ = std::thread(&ProcessManager::monitoringLoop, this);
 }
 
 ProcessManager::~ProcessManager() {
-    shutdown();
-}
-
-bool ProcessManager::initialize() {
-    try {
-        // Initial process scan
-        refreshProcessList();
-        
-        // Initialize system CPU time
-        last_system_cpu_time_ = getSystemCpuTime();
-        last_update_time_ = chrono::steady_clock::now();
-        
-        cout << "ProcessManager initialized successfully with " 
-             << processes_.size() << " processes" << endl;
-        
-        return true;
-    } catch (const exception& e) {
-        cerr << "Failed to initialize ProcessManager: " << e.what() << endl;
-        return false;
-    }
-}
-
-void ProcessManager::shutdown() {
-    shutdown_requested_ = true;
-    stopMonitoring();
-}
-
-vector<shared_ptr<ProcessInfo>> ProcessManager::getAllProcesses() {
-    lock_guard<mutex> lock(processes_mutex_);
-    vector<shared_ptr<ProcessInfo>> result;
-    result.reserve(processes_.size());
-    
-    for (const auto& pair : processes_) {
-        result.push_back(pair.second);
+    monitoring_active_.store(false);
+    if (monitor_thread_.joinable()) {
+        monitor_thread_.join();
     }
     
-    return result;
-}
-
-shared_ptr<ProcessInfo> ProcessManager::getProcessById(int pid) {
-    lock_guard<mutex> lock(processes_mutex_);
-    auto it = processes_.find(pid);
-    return (it != processes_.end()) ? it->second : nullptr;
-}
-
-void ProcessManager::refreshProcessList() {
-    auto current_pids = getRunningPids();
-    unordered_set<int> current_pid_set(current_pids.begin(), current_pids.end());
-    
-    {
-        lock_guard<mutex> lock(processes_mutex_);
-        
-        // Remove processes that are no longer running
-        auto it = processes_.begin();
-        while (it != processes_.end()) {
-            if (current_pid_set.find(it->first) == current_pid_set.end()) {
-                if (process_terminated_callback_) {
-                    process_terminated_callback_(it->first);
-                }
-                it = processes_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        
-        // Add or update existing processes
-        for (int pid : current_pids) {
-            auto existing = processes_.find(pid);
-            if (existing == processes_.end()) {
-                // New process
-                auto process_info = createProcessInfo(pid);
-                if (process_info) {
-                    processes_[pid] = process_info;
-                }
-            } else {
-                // Update existing process
-                updateProcessInfo(existing->second);
-            }
-        }
-    }
-}
-
-shared_ptr<ProcessInfo> ProcessManager::createProcessInfo(int pid) {
-    auto process = make_shared<ProcessInfo>();
-    process->pid = pid;
-    process->start_time = chrono::steady_clock::now();
-    process->last_cpu_time = chrono::steady_clock::now();
-    process->is_suspended = false;
-    process->cpu_percent = 0.0;
-    
-    if (!readProcessStats(pid, *process) || 
-        !readProcessStatus(pid, *process) ||
-        !readProcessCmdline(pid, *process)) {
-        return nullptr;
-    }
-    
-    // Check if this is a critical process
-    process->is_critical = isCriticalProcess(process->name);
-    
-    return process;
-}
-
-void ProcessManager::updateProcessInfo(shared_ptr<ProcessInfo> process) {
-    if (!process) return;
-    
-    if (!readProcessStats(process->pid, *process) ||
-        !readProcessStatus(process->pid, *process)) {
-        // Process might have terminated
-        return;
-    }
-    
-    calculateCpuUsage(process);
-    
-    if (process_change_callback_) {
-        process_change_callback_(*process);
-    }
-}
-
-bool ProcessManager::readProcessStats(int pid, ProcessInfo& info) {
-    ifstream stat_file("/proc/" + to_string(pid) + "/stat");
-    if (!stat_file.is_open()) {
-        return false;
-    }
-    
-    string line;
-    if (!getline(stat_file, line)) {
-        return false;
-    }
-    
-    istringstream iss(line);
-    string token;
-    vector<string> tokens;
-    
-    while (iss >> token) {
-        tokens.push_back(token);
-    }
-    
-    if (tokens.size() < 24) {
-        return false;
-    }
-    
-    try {
-        // Extract process name (remove parentheses)
-        info.name = tokens[1];
-        if (info.name.front() == '(' && info.name.back() == ')') {
-            info.name = info.name.substr(1, info.name.length() - 2);
-        }
-        
-        info.state = tokens[2];
-        info.priority = stoi(tokens[17]);
-        
-        // Memory usage from statm file
-        ifstream statm_file("/proc/" + to_string(pid) + "/statm");
-        if (statm_file.is_open()) {
-            long pages;
-            if (statm_file >> pages) {
-                long page_size = sysconf(_SC_PAGESIZE);
-                info.memory_usage = (pages * page_size) / 1024; // Convert to KB
-            }
-        }
-        
-    } catch (const exception& e) {
-        return false;
-    }
-    
-    return true;
-}
-
-bool ProcessManager::readProcessStatus(int pid, ProcessInfo& info) {
-    ifstream status_file("/proc/" + to_string(pid) + "/status");
-    if (!status_file.is_open()) {
-        return false;
-    }
-    
-    string line;
-    while (getline(status_file, line)) {
-        if (line.substr(0, 4) == "VmRSS:") {
-            istringstream iss(line);
-            string key, value, unit;
-            iss >> key >> value >> unit;
-            try {
-                info.memory_usage = stoull(value); // Already in KB
-            } catch (const exception& e) {
-                // Keep previous value or 0
-            }
-            break;
-        }
-    }
-    
-    return true;
-}
-
-bool ProcessManager::readProcessCmdline(int pid, ProcessInfo& info) {
-    ifstream cmdline_file("/proc/" + to_string(pid) + "/cmdline");
-    if (!cmdline_file.is_open()) {
-        info.command = info.name; // Fallback to process name
-        return true;
-    }
-    
-    string cmdline;
-    getline(cmdline_file, cmdline);
-    
-    // Replace null characters with spaces
-    replace(cmdline.begin(), cmdline.end(), '\0', ' ');
-    
-    if (cmdline.empty()) {
-        info.command = "[" + info.name + "]"; // Kernel thread
-    } else {
-        info.command = cmdline;
-    }
-    
-    return true;
-}
-
-vector<int> ProcessManager::getRunningPids() {
-    vector<int> pids;
-    DIR* proc_dir = opendir("/proc");
-    
-    if (!proc_dir) {
-        cerr << "Cannot open /proc directory" << endl;
-        return pids;
-    }
-    
-    struct dirent* entry;
-    while ((entry = readdir(proc_dir)) != nullptr) {
-        // Check if directory name is a number (PID)
-        char* endptr;
-        long pid = strtol(entry->d_name, &endptr, 10);
-        
-        if (*endptr == '\0' && pid > 0) {
-            // Verify it's actually a process directory
-            string proc_path = "/proc/" + string(entry->d_name);
-            struct stat stat_buf;
-            if (stat(proc_path.c_str(), &stat_buf) == 0 && S_ISDIR(stat_buf.st_mode)) {
-                pids.push_back(static_cast<int>(pid));
-            }
-        }
-    }
-    
-    closedir(proc_dir);
-    return pids;
-}
-
-void ProcessManager::calculateCpuUsage(shared_ptr<ProcessInfo> process) {
-    // Simplified CPU usage calculation
-    auto current_time = chrono::steady_clock::now();
-    auto time_diff = chrono::duration<double>(current_time - process->last_cpu_time).count();
-    
-    if (time_diff >= CPU_CALCULATION_INTERVAL) {
-        process->cpu_percent = min(100.0, process->cpu_percent + (rand() % 10 - 5) * 0.1);
-        process->cpu_percent = max(0.0, process->cpu_percent);
-        process->last_cpu_time = current_time;
-    }
-}
-
-double ProcessManager::getSystemCpuTime() {
-    ifstream stat_file("/proc/stat");
-    if (!stat_file.is_open()) {
-        return 0.0;
-    }
-    
-    string line;
-    if (!getline(stat_file, line)) {
-        return 0.0;
-    }
-    
-    istringstream iss(line);
-    string cpu;
-    long user, nice, system, idle;
-    
-    iss >> cpu >> user >> nice >> system >> idle;
-    
-    return static_cast<double>(user + nice + system + idle);
-}
-
-bool ProcessManager::pauseProcess(int pid) {
-    if (!isValidProcess(pid)) {
-        return false;
-    }
-    
-    if (kill(pid, SIGSTOP) == 0) {
-        auto process = getProcessById(pid);
-        if (process) {
-            process->is_suspended = true;
-        }
-        return true;
-    }
-    
-    return false;
-}
-
-bool ProcessManager::resumeProcess(int pid) {
-    if (!isValidProcess(pid)) {
-        return false;
-    }
-    
-    if (kill(pid, SIGCONT) == 0) {
-        auto process = getProcessById(pid);
-        if (process) {
-            process->is_suspended = false;
-        }
-        return true;
-    }
-    
-    return false;
+    // Restore all managed processes before destruction
+    restoreAllProcesses();
 }
 
 bool ProcessManager::terminateProcess(int pid) {
-    if (!isValidProcess(pid)) {
+    if (!canModifyProcess(pid)) {
         return false;
     }
     
-    auto process = getProcessById(pid);
-    if (process && process->is_critical) {
-        cerr << "Refusing to terminate critical process: " << process->name << endl;
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    // Update managed process info if it exists
+    auto it = managed_processes_.find(pid);
+    if (it != managed_processes_.end()) {
+        it->second.current_state = ProcessState::TERMINATED;
+        it->second.last_action_time = std::chrono::system_clock::now();
+        total_terminated_processes_++;
+    }
+    
+    bool success = killProcess(pid);
+    notifyProcessAction(pid, "terminate", success);
+    
+    return success;
+}
+
+bool ProcessManager::pauseProcess(int pid) {
+    if (!canModifyProcess(pid)) {
         return false;
     }
     
-    if (kill(pid, SIGTERM) == 0) {
-        this_thread::sleep_for(chrono::milliseconds(100));
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    auto it = managed_processes_.find(pid);
+    if (it != managed_processes_.end()) {
+        it->second.current_state = ProcessState::SUSPENDED;
+        it->second.last_action_time = std::chrono::system_clock::now();
+        total_suspended_processes_++;
+    }
+    
+    bool success = suspendProcess(pid);
+    notifyProcessAction(pid, "suspend", success);
+    
+    return success;
+}
+
+bool ProcessManager::resumeProcess(int pid) {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    auto it = managed_processes_.find(pid);
+    if (it != managed_processes_.end() && it->second.current_state == ProcessState::SUSPENDED) {
+        it->second.current_state = ProcessState::RUNNING;
+        it->second.last_action_time = std::chrono::system_clock::now();
+    }
+    
+    bool success = this->resumeProcess(pid);
+    notifyProcessAction(pid, "resume", success);
+    
+    return success;
+}
+
+bool ProcessManager::setProcessPriority(int pid, ProcessPriority priority) {
+    if (!canModifyProcess(pid)) {
+        return false;
+    }
+    
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    auto it = managed_processes_.find(pid);
+    if (it != managed_processes_.end()) {
+        it->second.current_priority = priority;
+        it->second.last_action_time = std::chrono::system_clock::now();
+    }
+    
+    bool success = setPriority(pid, priority);
+    notifyProcessAction(pid, "set_priority", success);
+    
+    return success;
+}
+
+bool ProcessManager::restoreProcessPriority(int pid) {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    auto it = managed_processes_.find(pid);
+    if (it != managed_processes_.end()) {
+        ProcessPriority original_priority = it->second.original_priority;
+        it->second.current_priority = original_priority;
+        it->second.last_action_time = std::chrono::system_clock::now();
         
-        if (isValidProcess(pid)) {
-            return kill(pid, SIGKILL) == 0;
-        }
-        return true;
+        return setPriority(pid, original_priority);
     }
     
     return false;
 }
 
-bool ProcessManager::setPriority(int pid, int priority) {
-    if (!isValidProcess(pid)) {
-        return false;
+// Batch operations
+bool ProcessManager::terminateProcessesByName(const std::string& name) {
+    auto processes = system_monitor_->getProcessesByName(name);
+    bool all_success = true;
+    
+    for (const auto& proc : processes) {
+        if (!terminateProcess(proc.pid)) {
+            all_success = false;
+        }
     }
     
-    priority = max(-20, min(19, priority));
+    return all_success;
+}
+
+bool ProcessManager::pauseProcessesByCategory(const std::string& category) {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    bool all_success = true;
     
-    if (setpriority(PRIO_PROCESS, pid, priority) == 0) {
-        auto process = getProcessById(pid);
-        if (process) {
-            process->priority = priority;
+    for (auto& [pid, managed_proc] : managed_processes_) {
+        if (managed_proc.category == category && !managed_proc.is_critical) {
+            if (!pauseProcess(pid)) {
+                all_success = false;
+            }
         }
+    }
+    
+    return all_success;
+}
+
+bool ProcessManager::resumeProcessesByCategory(const std::string& category) {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    bool all_success = true;
+    
+    for (auto& [pid, managed_proc] : managed_processes_) {
+        if (managed_proc.category == category && managed_proc.current_state == ProcessState::SUSPENDED) {
+            if (!resumeProcess(pid)) {
+                all_success = false;
+            }
+        }
+    }
+    
+    return all_success;
+}
+
+// Internal process control methods
+bool ProcessManager::killProcess(int pid) {
+    return sendSignal(pid, SIGTERM);
+}
+
+bool ProcessManager::suspendProcess(int pid) {
+    return sendSignal(pid, SIGSTOP);
+}
+
+bool ProcessManager::resumeProcess(int pid) {
+    return sendSignal(pid, SIGCONT);
+}
+
+bool ProcessManager::setPriority(int pid, ProcessPriority priority) {
+    return setProcessNiceValue(pid, static_cast<int>(priority));
+}
+
+bool ProcessManager::sendSignal(int pid, int signal) {
+    if (kill(pid, signal) == 0) {
         return true;
     }
-    
     return false;
 }
 
-bool ProcessManager::setAffinity(int pid, const vector<int>& cpu_cores) {
-    // Placeholder
-    return true;
+bool ProcessManager::setProcessNiceValue(int pid, int nice_value) {
+    // Clamp nice value to valid range
+    nice_value = std::clamp(nice_value, -20, 19);
+    
+    if (setpriority(PRIO_PROCESS, pid, nice_value) == 0) {
+        return true;
+    }
+    return false;
 }
 
-void ProcessManager::startMonitoring() {
-    if (monitoring_active_.load()) {
+int ProcessManager::getProcessNiceValue(int pid) {
+    errno = 0;
+    int nice_value = getpriority(PRIO_PROCESS, pid);
+    
+    if (errno == 0) {
+        return nice_value;
+    }
+    return 0; // Default nice value
+}
+
+// Process management
+void ProcessManager::addToManaged(int pid, bool is_critical) {
+    if (!system_monitor_->isProcessRunning(pid)) {
         return;
     }
     
-    monitoring_active_ = true;
-    monitoring_thread_ = thread(&ProcessManager::monitoringLoop, this);
+    ProcessInfo info = system_monitor_->getProcess(pid);
+    if (info.pid == -1) {
+        return;
+    }
+    
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    ManagedProcess managed;
+    managed.pid = pid;
+    managed.name = info.name;
+    managed.command = info.command;
+    managed.original_state = ProcessState::RUNNING;
+    managed.current_state = ProcessState::RUNNING;
+    managed.original_priority = static_cast<ProcessPriority>(getProcessNiceValue(pid));
+    managed.current_priority = managed.original_priority;
+    managed.is_managed = true;
+    managed.is_critical = is_critical || isProcessCritical(info.name);
+    managed.memory_limit_kb = 0; // No limit by default
+    managed.cpu_limit_percent = 100.0; // No limit by default
+    managed.last_action_time = std::chrono::system_clock::now();
+    managed.category = categorizeProcess(info);
+    
+    managed_processes_[pid] = managed;
 }
 
-void ProcessManager::stopMonitoring() {
-    monitoring_active_ = false;
-    if (monitoring_thread_.joinable()) {
-        monitoring_thread_.join();
+void ProcessManager::removeFromManaged(int pid) {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    auto it = managed_processes_.find(pid);
+    if (it != managed_processes_.end()) {
+        // Restore original state if possible
+        if (it->second.current_priority != it->second.original_priority) {
+            setPriority(pid, it->second.original_priority);
+        }
+        
+        if (it->second.current_state == ProcessState::SUSPENDED) {
+            resumeProcess(pid);
+        }
+        
+        managed_processes_.erase(it);
     }
 }
 
+bool ProcessManager::isManagedProcess(int pid) const {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    return managed_processes_.find(pid) != managed_processes_.end();
+}
+
+ManagedProcess ProcessManager::getManagedProcess(int pid) const {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    auto it = managed_processes_.find(pid);
+    if (it != managed_processes_.end()) {
+        return it->second;
+    }
+    
+    ManagedProcess empty;
+    empty.pid = -1;
+    return empty;
+}
+
+std::vector<ManagedProcess> ProcessManager::getAllManagedProcesses() const {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    std::vector<ManagedProcess> result;
+    result.reserve(managed_processes_.size());
+    
+    for (const auto& [pid, managed_proc] : managed_processes_) {
+        result.push_back(managed_proc);
+    }
+    
+    return result;
+}
+
+// Resource limits
+void ProcessManager::setMemoryLimit(int pid, size_t limit_kb) {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    auto it = managed_processes_.find(pid);
+    if (it != managed_processes_.end()) {
+        it->second.memory_limit_kb = limit_kb;
+    }
+}
+
+void ProcessManager::setCpuLimit(int pid, double limit_percent) {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    auto it = managed_processes_.find(pid);
+    if (it != managed_processes_.end()) {
+        it->second.cpu_limit_percent = std::clamp(limit_percent, 0.0, 100.0);
+    }
+}
+
+// Helper methods
+bool ProcessManager::isProcessCritical(const std::string& name) const {
+    return std::find(critical_process_names_.begin(), critical_process_names_.end(), name) 
+           != critical_process_names_.end();
+}
+
+bool ProcessManager::isSystemProcess(const std::string& name) const {
+    for (const auto& sys_name : system_process_names_) {
+        if (name.find(sys_name) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string ProcessManager::categorizeProcess(const ProcessInfo& info) const {
+    if (isProcessCritical(info.name)) {
+        return "critical";
+    }
+    
+    if (isSystemProcess(info.name)) {
+        return "system";
+    }
+    
+    // Simple categorization based on process name patterns
+    std::string lower_name = info.name;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+    
+    if (lower_name.find("game") != std::string::npos ||
+        lower_name.find("steam") != std::string::npos ||
+        lower_name.find("wine") != std::string::npos) {
+        return "gaming";
+    }
+    
+    if (lower_name.find("browser") != std::string::npos ||
+        lower_name.find("firefox") != std::string::npos ||
+        lower_name.find("chrome") != std::string::npos ||
+        lower_name.find("office") != std::string::npos ||
+        lower_name.find("editor") != std::string::npos) {
+        return "productivity";
+    }
+    
+    return "user";
+}
+
+bool ProcessManager::canModifyProcess(int pid) const {
+    // Check if process is critical
+    ProcessInfo info = system_monitor_->getProcess(pid);
+    if (info.pid == -1) {
+        return false;
+    }
+    
+    if (isProcessCritical(info.name)) {
+        return false;
+    }
+    
+    // Check permissions
+    return hasPermission(pid);
+}
+
+bool ProcessManager::hasPermission(int pid) const {
+    // Simple permission check - can we send signal 0 (null signal)?
+    return kill(pid, 0) == 0;
+}
+
+// Monitoring loop
 void ProcessManager::monitoringLoop() {
-    while (monitoring_active_.load() && !shutdown_requested_.load()) {
-        refreshProcessList();
-        this_thread::sleep_for(update_interval_);
+    while (monitoring_active_.load()) {
+        try {
+            updateManagedProcessInfo();
+            
+            if (auto_management_enabled_.load()) {
+                checkResourceLimits();
+                checkSystemThresholds();
+            }
+            
+        } catch (const std::exception& e) {
+            std::cerr << "ProcessManager monitoring error: " << e.what() << std::endl;
+        }
+        
+        std::this_thread::sleep_for(std::chrono::seconds(2));
     }
 }
 
-vector<shared_ptr<ProcessInfo>> ProcessManager::getHighCpuProcesses(double threshold) {
-    lock_guard<mutex> lock(processes_mutex_);
-    vector<shared_ptr<ProcessInfo>> result;
+void ProcessManager::updateManagedProcessInfo() {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
     
-    for (const auto& pair : processes_) {
-        if (pair.second->cpu_percent > threshold) {
-            result.push_back(pair.second);
+    // Remove processes that are no longer running
+    auto it = managed_processes_.begin();
+    while (it != managed_processes_.end()) {
+        if (!system_monitor_->isProcessRunning(it->first)) {
+            it = managed_processes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ProcessManager::checkResourceLimits() {
+    std::vector<int> violating_processes;
+    
+    {
+        std::lock_guard<std::mutex> lock(processes_mutex_);
+        
+        for (const auto& [pid, managed_proc] : managed_processes_) {
+            ProcessInfo current_info = system_monitor_->getProcess(pid);
+            
+            if (current_info.pid == -1) continue;
+            
+            // Check memory limit
+            if (managed_proc.memory_limit_kb > 0 && 
+                current_info.memory_usage_kb > managed_proc.memory_limit_kb) {
+                
+                notifyResourceLimitExceeded(pid, "memory", 
+                                          current_info.memory_usage_kb, 
+                                          managed_proc.memory_limit_kb);
+                violating_processes.push_back(pid);
+            }
+            
+            // Check CPU limit
+            if (managed_proc.cpu_limit_percent < 100.0 && 
+                current_info.cpu_usage > managed_proc.cpu_limit_percent) {
+                
+                notifyResourceLimitExceeded(pid, "cpu", 
+                                          current_info.cpu_usage, 
+                                          managed_proc.cpu_limit_percent);
+                violating_processes.push_back(pid);
+            }
         }
     }
     
-    sort(result.begin(), result.end(), 
-        [](const auto& a, const auto& b) {
-            return a->cpu_percent > b->cpu_percent;
-        });
-    
-    return result;
+    // Handle violating processes
+    for (int pid : violating_processes) {
+        if (cpu_throttling_enabled_.load()) {
+            setProcessPriority(pid, ProcessPriority::LOW);
+        }
+    }
 }
 
-vector<shared_ptr<ProcessInfo>> ProcessManager::getHighMemoryProcesses(size_t threshold) {
-    lock_guard<mutex> lock(processes_mutex_);
-    vector<shared_ptr<ProcessInfo>> result;
+void ProcessManager::checkSystemThresholds() {
+    SystemStats stats = system_monitor_->getSystemStatistics();
     
-    for (const auto& pair : processes_) {
-        if (pair.second->memory_usage > threshold) {
-            result.push_back(pair.second);
+    // Check system CPU usage
+    if (stats.cpu_usage_total > system_cpu_threshold_) {
+        notifySystemThresholdExceeded("cpu", stats.cpu_usage_total, system_cpu_threshold_);
+        handleHighSystemLoad();
+    }
+    
+    // Check system memory usage
+    double memory_usage_percent = 100.0 * stats.memory_used_kb / stats.memory_total_kb;
+    if (memory_usage_percent > system_memory_threshold_) {
+        notifySystemThresholdExceeded("memory", memory_usage_percent, system_memory_threshold_);
+        
+        if (memory_protection_enabled_.load()) {
+            emergencyKillHighMemoryProcesses();
+        }
+    }
+}
+
+void ProcessManager::handleHighSystemLoad() {
+    // Lower priority of non-critical processes
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    for (auto& [pid, managed_proc] : managed_processes_) {
+        if (!managed_proc.is_critical && managed_proc.category != "gaming") {
+            setProcessPriority(pid, ProcessPriority::LOW);
+        }
+    }
+}
+
+// Emergency actions
+void ProcessManager::emergencyKillHighMemoryProcesses() {
+    auto top_memory_processes = system_monitor_->getTopMemoryProcesses(5);
+    
+    for (const auto& proc : top_memory_processes) {
+        if (!isProcessCritical(proc.name) && proc.memory_usage_kb > memory_warning_threshold_kb_) {
+            std::cout << "Emergency terminating high memory process: " << proc.name 
+                     << " (PID: " << proc.pid << ", Memory: " << proc.memory_usage_kb << " KB)" << std::endl;
+            terminateProcess(proc.pid);
         }
     }
     
-    sort(result.begin(), result.end(), 
-        [](const auto& a, const auto& b) {
-            return a->memory_usage > b->memory_usage;
-        });
+    last_emergency_action_ = std::chrono::system_clock::now();
+}
+
+void ProcessManager::restoreAllProcesses() {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
     
-    return result;
+    for (auto& [pid, managed_proc] : managed_processes_) {
+        if (managed_proc.current_state == ProcessState::SUSPENDED) {
+            resumeProcess(pid);
+        }
+        
+        if (managed_proc.current_priority != managed_proc.original_priority) {
+            setPriority(pid, managed_proc.original_priority);
+        }
+    }
 }
 
-bool ProcessManager::isValidProcess(int pid) {
-    return pid > 0 && (kill(pid, 0) == 0 || errno != ESRCH);
+// Statistics
+size_t ProcessManager::getManagedProcessCount() const {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    return managed_processes_.size();
 }
 
-void ProcessManager::addCriticalProcess(const string& process_name) {
-    lock_guard<mutex> lock(critical_processes_mutex_);
-    critical_process_names_.insert(process_name);
+size_t ProcessManager::getSuspendedProcessCount() const {
+    std::lock_guard<std::mutex> lock(processes_mutex_);
+    
+    return std::count_if(managed_processes_.begin(), managed_processes_.end(),
+                        [](const auto& pair) {
+                            return pair.second.current_state == ProcessState::SUSPENDED;
+                        });
 }
 
-bool ProcessManager::isCriticalProcess(const string& process_name) const {
-    lock_guard<mutex> lock(critical_processes_mutex_);
-    return critical_process_names_.find(process_name) != critical_process_names_.end();
+// Callback methods
+void ProcessManager::registerProcessActionCallback(ProcessActionCallback callback) {
+    action_callbacks_.push_back(callback);
 }
 
-int ProcessManager::getActiveProcessCount() const {
-    lock_guard<mutex> lock(processes_mutex_);
-    return processes_.size();
+void ProcessManager::registerResourceLimitCallback(ResourceLimitCallback callback) {
+    resource_callbacks_.push_back(callback);
 }
 
-void ProcessManager::setProcessChangeCallback(function<void(const ProcessInfo&)> callback) {
-    process_change_callback_ = callback;
+void ProcessManager::registerSystemThresholdCallback(SystemThresholdCallback callback) {
+    threshold_callbacks_.push_back(callback);
 }
 
-void ProcessManager::setProcessTerminatedCallback(function<void(int)> callback) {
-    process_terminated_callback_ = callback;
+void ProcessManager::notifyProcessAction(int pid, const std::string& action, bool success) {
+    for (const auto& callback : action_callbacks_) {
+        callback(pid, action, success);
+    }
 }
 
-} // namespace SmartScheduler
+void ProcessManager::notifyResourceLimitExceeded(int pid, const std::string& resource, double usage, double limit) {
+    for (const auto& callback : resource_callbacks_) {
+        callback(pid, resource, usage, limit);
+    }
+}
+
+void ProcessManager::notifySystemThresholdExceeded(const std::string& resource, double usage, double threshold) {
+    for (const auto& callback : threshold_callbacks_) {
+        callback(resource, usage, threshold);
+    }
+}
+
+void ProcessManager::enableAutoManagement(bool enable) {
+    auto_management_enabled_.store(enable);
+}
