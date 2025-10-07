@@ -1,0 +1,11 @@
+{
+    "mode": "PowerSaving",
+    "priority_high": 5,
+    "priority_low": 15,
+    "time_quantum_ms": 100,
+    "memory_threshold_mb": 1024,
+    "cpu_affinity_cores": [0],
+    "cgroup_cpu_shares": 512,
+    "cgroup_memory_limit_mb": 2048,
+    "ipc_queue_size": 20
+}

@@ -1,0 +1,11 @@
+{
+    "mode": "Gaming",
+    "priority_high": -15,
+    "priority_low": 5,
+    "time_quantum_ms": 10,
+    "memory_threshold_mb": 2048,
+    "cpu_affinity_cores": [0, 1, 2, 3],
+    "cgroup_cpu_shares": 2048,
+    "cgroup_memory_limit_mb": 8192,
+    "ipc_queue_size": 100
+}

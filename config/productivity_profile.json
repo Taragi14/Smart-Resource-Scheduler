@@ -1,0 +1,11 @@
+{
+    "mode": "Productivity",
+    "priority_high": 0,
+    "priority_low": 10,
+    "time_quantum_ms": 50,
+    "memory_threshold_mb": 4096,
+    "cpu_affinity_cores": [0, 1],
+    "cgroup_cpu_shares": 1024,
+    "cgroup_memory_limit_mb": 4096,
+    "ipc_queue_size": 50
+}

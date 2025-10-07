@@ -1,0 +1,5 @@
+build/
+logs/
+*.o
+*.log
+*.json
